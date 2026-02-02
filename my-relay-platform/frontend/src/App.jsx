@@ -197,12 +197,12 @@ function InstanceCard({ instance, onRefresh, onSelect, isSelected }) {
   const statusColors = {
     pending: 'bg-yellow-500',
     launching: 'bg-yellow-500',
-    initializing: 'bg-yellow-500',
+    initializing: 'bg-blue-500', 
     ready: 'bg-green-500',
-    sending: 'bg-blue-500',
+    sending: 'bg-purple-500',
     terminating: 'bg-orange-500',
-    terminated: 'bg-gray-500',
-    error: 'bg-red-500',
+    terminated: 'bg-gray-600',
+    error: 'bg-red-600',
   };
   
   const handleTerminate = async () => {
@@ -232,18 +232,20 @@ function InstanceCard({ instance, onRefresh, onSelect, isSelected }) {
   
   return (
     <div 
-      className={`bg-gray-800 rounded-lg p-4 border-2 transition-all cursor-pointer
-        ${isSelected ? 'border-blue-500' : 'border-transparent hover:border-gray-600'}`}
+      className={`bg-gray-800 rounded-lg p-4 border-2 transition-all cursor-pointer relative overflow-hidden
+        ${isSelected ? 'border-blue-500' : 'border-transparent hover:border-gray-600'}
+        ${instance.status === 'error' ? 'border-red-500/50' : ''}`}
       onClick={() => instance.status === 'ready' && onSelect(instance)}
     >
       <div className="flex justify-between items-start mb-3">
         <div>
-          <h3 className="text-white font-medium">
+          <h3 className="text-white font-medium flex items-center gap-2">
+            {instance.status === 'error' && <span>⚠️</span>}
             {instance.name || `Instance #${instance.id}`}
           </h3>
           <p className="text-gray-400 text-sm">{instance.region}</p>
         </div>
-        <span className={`px-2 py-1 rounded text-xs text-white ${statusColors[instance.status] || 'bg-gray-500'}`}>
+        <span className={`px-2 py-1 rounded text-xs text-white font-bold uppercase tracking-wider ${statusColors[instance.status] || 'bg-gray-500'}`}>
           {instance.status}
         </span>
       </div>
@@ -265,8 +267,19 @@ function InstanceCard({ instance, onRefresh, onSelect, isSelected }) {
         )}
       </div>
       
-      {instance.status_message && (
-        <p className="text-gray-500 text-xs mt-2 italic">{instance.status_message}</p>
+      {/* ERROR DISPLAY BLOCK */}
+      {instance.status === 'error' ? (
+        <div className="mt-3 p-2 bg-red-900/30 border border-red-500/50 rounded text-red-200 text-xs font-mono break-all">
+          <span className="font-bold block mb-1 text-red-100">❌ Error Details:</span>
+          {instance.status_message}
+        </div>
+      ) : (
+        instance.status_message && (
+          <p className="text-gray-500 text-xs mt-2 italic truncate">
+            {['launching', 'initializing'].includes(instance.status) && <span className="animate-pulse">⏳ </span>}
+            {instance.status_message}
+          </p>
+        )
       )}
       
       <div className="flex gap-2 mt-4">
@@ -285,7 +298,7 @@ function InstanceCard({ instance, onRefresh, onSelect, isSelected }) {
             disabled={loading}
             className="flex-1 py-1 bg-red-600 hover:bg-red-700 text-white text-sm rounded disabled:opacity-50"
           >
-            Terminate
+            {instance.status === 'error' ? 'Clear / Terminate' : 'Terminate'}
           </button>
         )}
       </div>
@@ -455,7 +468,10 @@ function Dashboard({ user, onLogout }) {
   const [selectedInstance, setSelectedInstance] = useState(null);
   const [selectedRegion, setSelectedRegion] = useState('us-east-1');
   const [newInstanceName, setNewInstanceName] = useState('');
+  
+  // New state for handling launch errors
   const [loading, setLoading] = useState(false);
+  const [launchError, setLaunchError] = useState(null);
   
   const loadData = useCallback(async () => {
     try {
@@ -474,12 +490,13 @@ function Dashboard({ user, onLogout }) {
   
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 10000); // Refresh every 10s
+    const interval = setInterval(loadData, 5000); // 5s refresh
     return () => clearInterval(interval);
   }, [loadData]);
   
   const handleLaunch = async () => {
     setLoading(true);
+    setLaunchError(null); 
     try {
       await api.createInstance({
         region: selectedRegion,
@@ -488,7 +505,7 @@ function Dashboard({ user, onLogout }) {
       setNewInstanceName('');
       loadData();
     } catch (err) {
-      alert(err.message);
+      setLaunchError(err.message);
     } finally {
       setLoading(false);
     }
@@ -549,6 +566,13 @@ function Dashboard({ user, onLogout }) {
                   {loading ? 'Launching...' : '🚀 Launch'}
                 </button>
               </div>
+
+              {/* API ERROR DISPLAY */}
+              {launchError && (
+                <div className="mt-4 p-3 bg-red-900/50 border border-red-500 rounded text-red-200">
+                   <strong>Launch Failed:</strong> {launchError}
+                </div>
+              )}
             </div>
             
             {/* Active Instances */}
@@ -579,13 +603,11 @@ function Dashboard({ user, onLogout }) {
           
           {/* Right Column - Email */}
           <div className="space-y-6">
-            {/* Email Composer */}
             <EmailComposer
               instance={selectedInstance}
               onSent={loadData}
             />
             
-            {/* Email History */}
             <div className="bg-gray-800 rounded-lg p-6">
               <h2 className="text-lg font-bold text-white mb-4">📜 Recent Emails</h2>
               <EmailHistory emails={emails} />

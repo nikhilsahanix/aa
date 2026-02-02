@@ -542,6 +542,32 @@ async def check_instance_health(
     return health
 
 
+@app.get("/instances/{instance_id}/logs")
+async def get_instance_logs(
+    instance_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Fetch installation logs from the remote instance."""
+    instance = db.query(RelayInstance).filter(
+        RelayInstance.id == instance_id,
+        RelayInstance.owner_id == current_user.id
+    ).first()
+    
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    
+    if not instance.public_ip:
+        return {"logs": "Instance has no IP yet. Wait for initialization..."}
+    
+    # Connect to the agent and ask for logs
+    try:
+        client = RelayAgentClient(f"http://{instance.public_ip}:8000")
+        logs = await client.get_logs() # Ensure this method exists in your aws_service.py
+        return {"logs": logs}
+    except Exception as e:
+        return {"logs": f"Failed to fetch logs: {str(e)}"}
+
 # ============== Email Endpoints ==============
 
 @app.post("/emails/send", response_model=EmailResponse)
