@@ -3,14 +3,9 @@
 # AWS Lightsail Deployment Script for Relay Platform
 # ============================================================
 # 
-# This script sets up the complete Relay Platform on a fresh
-# Ubuntu 22.04 Lightsail instance.
-#
 # Usage:
-#   1. Create Lightsail instance (Ubuntu 22.04, medium recommended)
-#   2. SSH into the instance
-#   3. Run: curl -sSL https://your-url/setup.sh | bash
-#   OR copy this script and run it
+#   1. SSH into your fresh Ubuntu 22.04 Instance
+#   2. Run: sudo bash setup.sh
 #
 # ============================================================
 
@@ -27,19 +22,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Check if running as root or with sudo
+# Check if running as root
 if [ "$EUID" -ne 0 ]; then 
     echo -e "${RED}Please run with sudo: sudo bash setup.sh${NC}"
     exit 1
 fi
 
-# Get the non-root user (the one who called sudo)
-ACTUAL_USER=${SUDO_USER:-ubuntu}
-HOME_DIR=$(eval echo ~$ACTUAL_USER)
-
-echo -e "${GREEN}Installing as user: $ACTUAL_USER${NC}"
-echo -e "${GREEN}Home directory: $HOME_DIR${NC}"
-echo ""
+APP_DIR="/opt/relay-platform"
 
 # ============================================================
 # Step 1: System Updates
@@ -60,13 +49,10 @@ apt-get install -y python3.11 python3.11-venv python3-pip
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
 
-# Nginx (reverse proxy)
-apt-get install -y nginx
+# Nginx & Certbot
+apt-get install -y nginx certbot python3-certbot-nginx
 
-# Certbot for SSL (optional but recommended)
-apt-get install -y certbot python3-certbot-nginx
-
-# Other utilities
+# Utilities
 apt-get install -y git curl wget unzip htop
 
 echo -e "${GREEN}✓ Dependencies installed${NC}"
@@ -86,36 +72,30 @@ fi
 echo -e "${GREEN}✓ AWS CLI installed${NC}"
 
 # ============================================================
-# Step 4: Create Application Directory
+# Step 4: Create Directory Structure
 # ============================================================
-echo -e "${YELLOW}[4/8] Setting up application directory...${NC}"
+echo -e "${YELLOW}[4/8] Setting up directories...${NC}"
 
-APP_DIR="/opt/relay-platform"
 mkdir -p $APP_DIR
 cd $APP_DIR
-
-# Create directory structure
 mkdir -p backend frontend data logs
 
-echo -e "${GREEN}✓ Directory structure created at $APP_DIR${NC}"
-
 # ============================================================
-# Step 5: Create Backend Files
+# Step 5: Backend Setup
 # ============================================================
-echo -e "${YELLOW}[5/8] Creating backend application...${NC}"
+echo -e "${YELLOW}[5/8] Creating Backend...${NC}"
 
-# Create Python virtual environment
+# Virtual Env
 python3.11 -m venv $APP_DIR/venv
 source $APP_DIR/venv/bin/activate
 
-# Install Python packages
+# Install Python Deps
 pip install --upgrade pip
 pip install fastapi uvicorn[standard] sqlalchemy python-jose[cryptography] \
     passlib[bcrypt] python-multipart boto3 aiohttp requests pydantic[email]
 
-# Create backend files (models.py)
+# --- models.py ---
 cat > $APP_DIR/backend/models.py << 'MODELS_PY'
-"""Database Models for Relay Platform"""
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Enum, create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -198,15 +178,14 @@ def get_session_factory(engine):
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
 MODELS_PY
 
-# Create auth.py
+# --- auth.py ---
 cat > $APP_DIR/backend/auth.py << 'AUTH_PY'
-"""JWT Authentication"""
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-me")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production-please")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -226,24 +205,17 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
 
 def decode_token(token: str):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
         return None
 AUTH_PY
 
-# Create aws_service.py
+# --- aws_service.py ---
 cat > $APP_DIR/backend/aws_service.py << 'AWS_PY'
-"""AWS EC2 Relay Service"""
-import boto3
-import asyncio
-import aiohttp
-import logging
-import requests
-from typing import Optional, List
+import boto3, asyncio, aiohttp, logging, requests
+from typing import Optional
 from dataclasses import dataclass
 from datetime import datetime
-from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -257,6 +229,7 @@ class InstanceInfo:
     state: str
     launch_time: Optional[datetime] = None
 
+# Script that runs ON the EC2 instance
 USER_DATA_SCRIPT = '''#!/bin/bash
 set -e
 exec > >(tee /var/log/user-data.log) 2>&1
@@ -323,7 +296,6 @@ systemctl daemon-reload && systemctl enable relay-agent && systemctl start relay
 class AWSRelayService:
     INSTANCE_TYPE = "t3.micro"
     SG_NAME = "relay-platform-sg"
-    API_PORT = 8000
 
     def __init__(self, region="us-east-1"):
         self.region = region
@@ -333,7 +305,7 @@ class AWSRelayService:
 
     @staticmethod
     def get_regions():
-        return ['us-east-1','us-east-2','us-west-1','us-west-2','eu-west-1','eu-west-2','eu-central-1','ap-south-1','ap-southeast-1','ap-northeast-1']
+        return ['us-east-1','us-east-2','us-west-1','us-west-2','eu-west-1','eu-central-1','ap-south-1','ap-southeast-1']
 
     def get_my_ip(self):
         for svc in ['https://api.ipify.org','https://ifconfig.me/ip']:
@@ -384,12 +356,6 @@ class AWSRelayService:
             return True
         except: return False
 
-    def status(self, iid):
-        try:
-            i = self.ec2.describe_instances(InstanceIds=[iid])['Reservations'][0]['Instances'][0]
-            return InstanceInfo(iid, i.get('PublicIpAddress'), self.region, i['State']['Name'])
-        except: return None
-
 class RelayClient:
     def __init__(self, url):
         self.url = url.rstrip('/')
@@ -404,6 +370,7 @@ class RelayClient:
     async def send(self, smtp_user, smtp_pass, to, subject, body, html=None):
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                # Correct payload keys matching Agent
                 async with s.post(f"{self.url}/send", json={"smtp_user":smtp_user,"smtp_pass":smtp_pass,"to_address":to,"subject":subject,"body":body,"html_body":html}) as r:
                     return await r.json()
         except Exception as e: return {"success":False,"error":str(e)}
@@ -426,28 +393,22 @@ async def async_terminate(region, iid):
     return await loop.run_in_executor(executor, AWSRelayService(region).terminate, iid)
 AWS_PY
 
-# Create main.py (FastAPI app)
+# --- main.py ---
 cat > $APP_DIR/backend/main.py << 'MAIN_PY'
-"""Relay Platform API"""
-import asyncio
-import logging
+import asyncio, logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-
 from models import User, RelayInstance, EmailRecord, InstanceStatus, EmailStatus, init_database, get_session_factory
 from auth import verify_password, get_password_hash, create_access_token, decode_token
 from aws_service import AWSRelayService, RelayClient, async_launch, async_terminate
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 engine = init_database()
 SessionFactory = get_session_factory(engine)
 
@@ -462,7 +423,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Relay Platform", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
 oauth2 = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 def get_db():
@@ -477,7 +437,6 @@ async def get_user(token: str = Depends(oauth2), db: Session = Depends(get_db)):
     if not user: raise HTTPException(401, "User not found")
     return user
 
-# Schemas
 class UserCreate(BaseModel):
     username: str
     email: EmailStr
@@ -495,7 +454,6 @@ class EmailSend(BaseModel):
     subject: str
     body: str
 
-# Auth
 @app.post("/auth/register")
 async def register(data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == data.username).first():
@@ -517,7 +475,6 @@ async def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depen
 async def me(user: User = Depends(get_user)):
     return {"id": user.id, "username": user.username, "email": user.email, "is_admin": user.is_admin}
 
-# Instances
 @app.get("/instances")
 async def list_instances(user: User = Depends(get_user), db: Session = Depends(get_db)):
     instances = db.query(RelayInstance).filter(RelayInstance.owner_id == user.id, RelayInstance.status != InstanceStatus.TERMINATED).all()
@@ -585,7 +542,6 @@ async def instance_health(id: int, user: User = Depends(get_user), db: Session =
     if not inst or not inst.public_ip: raise HTTPException(404)
     return await RelayClient(f"http://{inst.public_ip}:8000").health()
 
-# Email
 @app.post("/emails/send")
 async def send_email(data: EmailSend, user: User = Depends(get_user), db: Session = Depends(get_db)):
     inst = db.query(RelayInstance).filter(RelayInstance.id == data.instance_id, RelayInstance.owner_id == user.id).first()
@@ -620,16 +576,16 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
 MAIN_PY
 
-echo -e "${GREEN}✓ Backend created${NC}"
+echo -e "${GREEN}✓ Backend Created${NC}"
 
 # ============================================================
-# Step 6: Create Frontend
+# Step 6: Create Frontend (FIXED REACT CODE)
 # ============================================================
 echo -e "${YELLOW}[6/8] Building frontend...${NC}"
 
 cd $APP_DIR/frontend
 
-# Create package.json
+# package.json
 cat > package.json << 'PKG'
 {
   "name": "relay-frontend",
@@ -649,7 +605,7 @@ cat > package.json << 'PKG'
 }
 PKG
 
-# Create vite.config.js
+# vite.config.js
 cat > vite.config.js << 'VITE'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -659,7 +615,7 @@ export default defineConfig({
 })
 VITE
 
-# Create index.html
+# index.html
 cat > index.html << 'HTML'
 <!DOCTYPE html>
 <html lang="en">
@@ -678,7 +634,7 @@ HTML
 
 mkdir -p src
 
-# Create main.jsx
+# main.jsx
 cat > src/main.jsx << 'MAINJS'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
@@ -686,7 +642,7 @@ import App from './App.jsx'
 ReactDOM.createRoot(document.getElementById('root')).render(<App />)
 MAINJS
 
-# Create App.jsx (simplified version)
+# --- App.jsx (CORRECTED VERSION) ---
 cat > src/App.jsx << 'APPJS'
 import React, { useState, useEffect, useCallback } from 'react';
 const API = '';
@@ -697,7 +653,10 @@ const api = {
     const r = await fetch(API + url, { ...opt, headers: { 'Content-Type': 'application/json', ...(this.token && { Authorization: `Bearer ${this.token}` }), ...opt.headers } });
     if (r.status === 401) { this.setToken(null); location.reload(); }
     const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || 'Error');
+    if (!r.ok) {
+       if (r.status === 422 && Array.isArray(d.detail)) throw new Error(d.detail.map(e => `${e.loc[1]}: ${e.msg}`).join('\n'));
+       throw new Error(d.detail || 'Error');
+    }
     return d;
   }
 };
@@ -757,23 +716,27 @@ function Dashboard({ user, onLogout }) {
   const [region, setRegion] = useState('us-east-1');
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
-  const [smtp, setSmtp] = useState({ user: '', pass: '', to: '', subject: '', body: '' });
+  const [smtp, setSmtp] = useState({ smtp_user: '', smtp_pass: '', to_address: '', subject: '', body: '' });
   const [sendResult, setSendResult] = useState(null);
 
   const load = useCallback(async () => {
-    const [i, e, r] = await Promise.all([api.req('/instances'), api.req('/emails'), api.req('/regions')]);
-    setInstances(i);
-    setEmails(e);
-    setRegions(r);
+    try {
+        const [i, e, r] = await Promise.all([api.req('/instances'), api.req('/emails'), api.req('/regions')]);
+        setInstances(i);
+        setEmails(e);
+        setRegions(r);
+    } catch(err) { console.error(err); }
   }, []);
 
-  useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [load]);
+  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
 
   const launch = async () => {
     setLoading(true);
-    await api.req('/instances', { method: 'POST', body: JSON.stringify({ region, name: name || undefined }) });
-    setName('');
-    load();
+    try {
+      await api.req('/instances', { method: 'POST', body: JSON.stringify({ region, name: name || undefined }) });
+      setName('');
+      load();
+    } catch (e) { alert(e.message); }
     setLoading(false);
   };
 
@@ -787,9 +750,16 @@ function Dashboard({ user, onLogout }) {
     e.preventDefault();
     if (!selected) return;
     setSendResult(null);
-    const r = await api.req('/emails/send', { method: 'POST', body: JSON.stringify({ instance_id: selected.id, ...smtp }) });
-    setSendResult(r);
-    if (r.success) { setSmtp({ ...smtp, to: '', subject: '', body: '' }); load(); }
+    try {
+        const r = await api.req('/emails/send', { method: 'POST', body: JSON.stringify({ instance_id: parseInt(selected.id), ...smtp }) });
+        setSendResult(r);
+        if (r.success) { 
+            setSmtp({ ...smtp, to_address: '', subject: '', body: '' }); 
+            load(); 
+        }
+    } catch(e) {
+        setSendResult({ success: false, error: e.message });
+    }
   };
 
   const colors = { pending: 'bg-yellow-500', launching: 'bg-yellow-500', initializing: 'bg-yellow-500', ready: 'bg-green-500', error: 'bg-red-500', terminating: 'bg-orange-500' };
@@ -835,9 +805,9 @@ function Dashboard({ user, onLogout }) {
             <h2 className="text-lg font-bold text-white mb-4">✉️ Send Email</h2>
             {!selected ? <p className="text-gray-400">Select a ready instance</p> : (
               <form onSubmit={send} className="space-y-3">
-                <input placeholder="Gmail" value={smtp.user} onChange={e => setSmtp({ ...smtp, user: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
-                <input type="password" placeholder="App Password" value={smtp.pass} onChange={e => setSmtp({ ...smtp, pass: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
-                <input placeholder="To" value={smtp.to} onChange={e => setSmtp({ ...smtp, to: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
+                <input placeholder="Gmail" value={smtp.smtp_user} onChange={e => setSmtp({ ...smtp, smtp_user: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
+                <input type="password" placeholder="App Password" value={smtp.smtp_pass} onChange={e => setSmtp({ ...smtp, smtp_pass: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
+                <input placeholder="To" value={smtp.to_address} onChange={e => setSmtp({ ...smtp, to_address: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
                 <input placeholder="Subject" value={smtp.subject} onChange={e => setSmtp({ ...smtp, subject: e.target.value })} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
                 <textarea placeholder="Body" value={smtp.body} onChange={e => setSmtp({ ...smtp, body: e.target.value })} rows={3} className="w-full p-2 bg-gray-700 text-white rounded text-sm" required />
                 {sendResult && <div className={sendResult.success ? 'text-green-400' : 'text-red-400'}>{sendResult.success ? '✓ Sent!' : sendResult.error}</div>}
@@ -904,31 +874,10 @@ server {
     }
     
     # API proxy
-    location /auth {
+    location ~ ^/(auth|instances|emails|regions|health) {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-    }
-    
-    location /instances {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-    
-    location /emails {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-    
-    location /regions {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-    }
-    
-    location /health {
-        proxy_pass http://127.0.0.1:8080;
     }
 }
 NGINX
@@ -987,21 +936,11 @@ echo "IMPORTANT NEXT STEPS:"
 echo "============================================================"
 echo ""
 echo "1. Configure AWS credentials:"
-echo "   sudo -u ubuntu aws configure"
+echo "   aws configure"
 echo ""
 echo "2. Change the SECRET_KEY in:"
 echo "   /etc/systemd/system/relay-platform.service"
-echo "   Then: sudo systemctl daemon-reload && sudo systemctl restart relay-platform"
 echo ""
 echo "3. (Optional) Add SSL with Let's Encrypt:"
-echo "   sudo certbot --nginx -d your-domain.com"
-echo ""
-echo "4. Change the default admin password after login!"
-echo ""
-echo "============================================================"
-echo "Useful Commands:"
-echo "============================================================"
-echo "  View logs:    sudo journalctl -u relay-platform -f"
-echo "  Restart API:  sudo systemctl restart relay-platform"
-echo "  Restart Nginx: sudo systemctl restart nginx"
+echo "   certbot --nginx"
 echo "============================================================"

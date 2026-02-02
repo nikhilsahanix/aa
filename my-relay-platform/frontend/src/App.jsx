@@ -36,13 +36,24 @@ const api = {
       headers,
     });
     
+    // Handle 401 Unauthorized (Token expired)
     if (response.status === 401) {
       this.setToken(null);
       window.location.reload();
     }
     
     const data = await response.json();
+    
     if (!response.ok) {
+      // FIX: Better handling for 422 Validation Errors (shows exactly which field failed)
+      if (response.status === 422 && Array.isArray(data.detail)) {
+        const errorMsg = data.detail
+          .map(err => `${err.loc[1] || 'field'}: ${err.msg}`)
+          .join('\n');
+        throw new Error(errorMsg);
+      }
+      
+      // Handle standard errors
       throw new Error(data.detail || 'Request failed');
     }
     return data;
@@ -322,11 +333,12 @@ function EmailComposer({ instance, onSent }) {
     setResult(null);
     
     try {
+      // FIX: Ensure keys match backend expectations exactly
       const response = await api.sendEmail({
-        instance_id: instance.id,
-        smtp_user: smtpUser,
-        smtp_pass: smtpPass,
-        to_address: toAddress,
+        instance_id: parseInt(instance.id, 10), // Force integer
+        smtp_user: smtpUser,     // Was 'user'
+        smtp_pass: smtpPass,     // Was 'pass'
+        to_address: toAddress,   // Was 'to'
         subject,
         body,
       });
